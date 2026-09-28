@@ -72,8 +72,9 @@ func ComputeWorkerResourceTemplateName(wdName, wrtName, buildID string) string {
 //
 // Processing order:
 //  1. Unmarshal spec.template into an Unstructured
-//  2. Auto-inject scaleTargetRef and matchLabels (Layer 1)
-//  3. Set metadata (name, namespace, labels, owner reference)
+//  2. Substitute per-version metric tokens in string values
+//  3. Auto-inject scaleTargetRef, matchLabels, and KEDA temporal trigger metadata
+//  4. Set metadata (name, namespace, labels, owner reference)
 func RenderWorkerResourceTemplate(
 	wrt *temporaliov1alpha1.WorkerResourceTemplate,
 	deployment *appsv1.Deployment,
@@ -104,7 +105,10 @@ func RenderWorkerResourceTemplate(
 		"temporal_namespace":              temporalNamespace,
 	}
 
-	// Step 2: auto-inject scaleTargetRef, selector.matchLabels, metric selector labels,
+	// Step 2: per-version metric tokens. Values match metricSelectorLabels.
+	substituteMetricTemplateVars(obj.Object, metricSelectorLabels)
+
+	// Step 3: auto-inject scaleTargetRef, selector.matchLabels, metric selector labels,
 	// and KEDA Temporal trigger metadata. NestedFieldNoCopy returns a live reference so
 	// mutations are reflected in obj.Object directly.
 	if specRaw, ok, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec"); ok {
@@ -113,7 +117,7 @@ func RenderWorkerResourceTemplate(
 		}
 	}
 
-	// Step 3: set metadata using Unstructured typed methods.
+	// Step 4: set metadata using Unstructured typed methods.
 	resourceName := ComputeWorkerResourceTemplateName(wrt.Spec.EffectiveWorkerDeploymentName(), wrt.Name, buildID)
 	obj.SetName(resourceName)
 	obj.SetNamespace(wrt.Namespace)
@@ -146,6 +150,46 @@ func RenderWorkerResourceTemplate(
 	})
 
 	return obj, nil
+}
+
+// substituteMetricTemplateVars replaces the exact tokens
+// {{temporal_worker_deployment_name}}, {{temporal_worker_build_id}}, and
+// {{temporal_namespace}} in every string under v. Same opt-in as an empty
+// matchLabels or "": only that sentinel is written.
+func substituteMetricTemplateVars(v interface{}, vars map[string]string) {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		for key, child := range typed {
+			if s, ok := child.(string); ok {
+				typed[key] = substituteMetricTemplateString(s, vars)
+				continue
+			}
+			substituteMetricTemplateVars(child, vars)
+		}
+	case []interface{}:
+		for i, child := range typed {
+			if s, ok := child.(string); ok {
+				typed[i] = substituteMetricTemplateString(s, vars)
+				continue
+			}
+			substituteMetricTemplateVars(child, vars)
+		}
+	}
+}
+
+func substituteMetricTemplateString(s string, vars map[string]string) string {
+	if !strings.Contains(s, "{{") {
+		return s
+	}
+	for _, key := range temporaliov1alpha1.ControllerOwnedMetricLabelKeys {
+		token := "{{" + key + "}}"
+		value, ok := vars[key]
+		if !ok || !strings.Contains(s, token) {
+			continue
+		}
+		s = strings.ReplaceAll(s, token, value)
+	}
+	return s
 }
 
 // autoInjectFields applies the controller-owned injections to the top-level spec map:
